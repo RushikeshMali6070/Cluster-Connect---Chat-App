@@ -1,0 +1,110 @@
+services:
+
+  # ─────────────────────────────────────────
+  # ZOOKEEPER (required by Kafka)
+  # ─────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: clusterconnect-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  # KAFKA
+  # ─────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: clusterconnect-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_LOG_RETENTION_HOURS: 168
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  # REDIS
+  # ─────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: clusterconnect-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - app-network
+    restart: unless-stopped
+    command: redis-server --appendonly yes  # Enable persistence
+    volumes:
+      - redis-data:/data
+
+  # ─────────────────────────────────────────
+  # MONGODB (matches k8s/mongodb.yaml)
+  # Credentials: admin / rushikesh@123  |  DB: clusterconnect
+  # ─────────────────────────────────────────
+  mongodb:
+    image: mongo:7.0
+    container_name: clusterconnect-mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: rushikesh@123
+      MONGO_INITDB_DATABASE: clusterconnect
+    volumes:
+      - mongodb-data:/data/db
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  # BACKEND (production profile only)
+  # Run:  docker-compose --profile production up --build
+  # ─────────────────────────────────────────
+  backend:
+    profiles: ["production"]
+    build: .
+    container_name: clusterconnect-backend
+    depends_on:
+      - kafka
+      - redis
+      - mongodb
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      KAFKA_BROKER: kafka:9092
+      KAFKA_BROKERS: kafka:9092
+      REDIS_URL: redis://redis:6379
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # Overrides the Atlas URL from .env — uses the local MongoDB container instead
+      MONGODB_URL: mongodb://admin:rushikesh@123@mongodb:27017/clusterconnect?authSource=admin
+    networks:
+      - app-network
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  mongodb-data:
+
+networks:
+  app-network:
+    driver: bridge
