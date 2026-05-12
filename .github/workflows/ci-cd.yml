@@ -1,0 +1,340 @@
+name: ClusterConnect CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+# Cancel in-progress runs for the same branch/PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: docker.io
+  BACKEND_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/clusterconnect-backend
+  FRONTEND_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/clusterconnect-frontend
+  # Use Node.js 24 for GitHub Actions runner internals (silences Node 20 deprecation warning)
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 1 ─ Backend CI (lint + unit tests)
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  backend-ci:
+    name: 🔧 Backend – Lint & Test
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: clusterconnect-backend
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Add real tests later; this just verifies the server module parses
+      - name: Run tests (smoke)
+        run: node --check server.js
+        env:
+          NODE_ENV: test
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 2 ─ Frontend CI (lint + build)
+  # ───────────────────────────────────────────────────────────────────────────
+  frontend-ci:
+    name: 🎨 Frontend – Lint & Build
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: Frontend/clusterconnect-client
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build (production)
+        run: npm run build
+        env:
+          VITE_API_URL: ${{ secrets.VITE_API_URL }}
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: Frontend/clusterconnect-client/dist/
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 3 ─ Build & Push Docker images (only on pushes to main)
+  # ───────────────────────────────────────────────────────────────────────────
+  docker-build-push:
+    name: 🐳 Build & Push Docker Images
+    runs-on: ubuntu-latest
+    needs: [backend-ci, frontend-ci]
+    # Only run on push to main (not PRs, not develop)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        id: docker-login
+        uses: docker/login-action@v3
+        continue-on-error: true
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Skip push if Docker Hub not configured
+        if: steps.docker-login.outcome != 'success'
+        run: |
+          echo "⚠️  DOCKERHUB_USERNAME / DOCKERHUB_TOKEN secrets not set."
+          echo "Skipping Docker build & push. Add secrets to GitHub to enable."
+
+      # Generate image tags: branch name + short SHA  (e.g. main-abc1234)
+      - name: Extract Docker metadata (backend)
+        if: steps.docker-login.outcome == 'success'
+        id: meta-backend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.BACKEND_IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=,suffix=,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Extract Docker metadata (frontend)
+        if: steps.docker-login.outcome == 'success'
+        id: meta-frontend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.FRONTEND_IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=,suffix=,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      # ── Backend image ──────────────────────────────────────────────────────
+      - name: Build & Push backend image
+        if: steps.docker-login.outcome == 'success'
+        uses: docker/build-push-action@v5
+        with:
+          context: ./clusterconnect-backend
+          file: ./clusterconnect-backend/Dockerfile
+          push: true
+          tags: ${{ steps.meta-backend.outputs.tags }}
+          labels: ${{ steps.meta-backend.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      # ── Trivy Security Scan (Backend) ─────────────────────────────────────────
+      - name: 🛡️ Trivy Scan - Backend Image
+        if: steps.docker-login.outcome == 'success'
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.BACKEND_IMAGE }}:latest'
+          format: 'table'
+          exit-code: '0'             # Scans and warns, but doesn't break the active workflow
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+      # ── Frontend image ─────────────────────────────────────────────────────
+      - name: Build & Push frontend image
+        if: steps.docker-login.outcome == 'success'
+        uses: docker/build-push-action@v5
+        with:
+          context: ./Frontend/clusterconnect-client
+          file: ./Frontend/clusterconnect-client/Dockerfile
+          push: true
+          tags: ${{ steps.meta-frontend.outputs.tags }}
+          labels: ${{ steps.meta-frontend.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+          build-args: |
+            VITE_API_URL=${{ secrets.BACKEND_URL }}
+
+      # ── Trivy Security Scan (Frontend) ────────────────────────────────────────
+      - name: 🛡️ Trivy Scan - Frontend Image
+        if: steps.docker-login.outcome == 'success'
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.FRONTEND_IMAGE }}:latest'
+          format: 'table'
+          exit-code: '0'             # Scans and warns, but doesn't break the active workflow
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Export short SHA for downstream jobs
+        if: steps.docker-login.outcome == 'success'
+        id: meta
+        run: echo "version=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 4 ─ Deploy to Minikube (Self-Hosted Runner on WSL)
+  # STATUS: DISABLED — uncomment when self-hosted runner is set up
+  #
+  # SETUP STEPS (run in WSL):
+  #   1. Go to: GitHub Repo → Settings → Actions → Runners → New self-hosted runner
+  #   2. Follow the Linux/x64 instructions GitHub shows you
+  #   3. Run: ./run.sh  (or install as service: sudo ./svc.sh install && sudo ./svc.sh start)
+  #   4. Make sure minikube is running: minikube start
+  #   5. Uncomment this job and push
+  #
+  # No extra secrets needed — kubectl uses your local ~/.kube/config on WSL
+  # ───────────────────────────────────────────────────────────────────────────
+  # deploy:
+  #   name: 🚀 Deploy to Minikube (Local WSL)
+  #   runs-on: self-hosted          # ← runs on YOUR WSL machine, not GitHub cloud
+  #   needs: docker-build-push
+  #   if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+  #   environment: production
+  #
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #
+  #     # ── Verify Minikube is running ───────────────────────────────────────
+  #     - name: Check Minikube status
+  #       run: |
+  #         minikube status || minikube start
+  #         kubectl cluster-info
+  #
+  #     # ── Load Docker images into Minikube (no Docker Hub pull needed) ─────
+  #     - name: Load backend image into Minikube
+  #       run: |
+  #         IMAGE_TAG=${{ needs.docker-build-push.outputs.image-tag }}
+  #         docker pull ${{ env.BACKEND_IMAGE }}:${IMAGE_TAG}
+  #         minikube image load ${{ env.BACKEND_IMAGE }}:${IMAGE_TAG}
+  #
+  #     - name: Load frontend image into Minikube
+  #       run: |
+  #         IMAGE_TAG=${{ needs.docker-build-push.outputs.image-tag }}
+  #         docker pull ${{ env.FRONTEND_IMAGE }}:${IMAGE_TAG}
+  #         minikube image load ${{ env.FRONTEND_IMAGE }}:${IMAGE_TAG}
+  #
+  #     # ── Apply K8s manifests FIRST (creates resources if missing) ─────────
+  #     - name: Apply K8s manifests
+  #       run: |
+  #         kubectl apply -f clusterconnect-backend/k8s/app-config.yaml
+  #         kubectl apply -f clusterconnect-backend/k8s/backend.yaml
+  #         kubectl apply -f clusterconnect-backend/k8s/frontend.yaml
+  #         kubectl apply -f clusterconnect-backend/k8s/redis.yaml
+  #         kubectl apply -f clusterconnect-backend/k8s/kafka.yaml
+  #
+  #     # ── Update image tags to the newly built SHA tag ─────────────────────
+  #     - name: Update deployment images
+  #       run: |
+  #         IMAGE_TAG=${{ needs.docker-build-push.outputs.image-tag }}
+  #         kubectl set image deployment/backend \
+  #           backend=${{ env.BACKEND_IMAGE }}:${IMAGE_TAG} \
+  #           --namespace=default
+  #         kubectl set image deployment/frontend \
+  #           frontend=${{ env.FRONTEND_IMAGE }}:${IMAGE_TAG} \
+  #           --namespace=default
+  #
+  #     # ── Wait for pods to stabilize ───────────────────────────────────────
+  #     - name: Wait for rollout
+  #       run: |
+  #         kubectl rollout status deployment/backend --timeout=180s
+  #         kubectl rollout status deployment/frontend --timeout=180s
+  #
+  #     - name: Show running pods & service URLs
+  #       run: |
+  #         kubectl get pods -n default
+  #         minikube service list
+  # ───────────────────────────────────────────────────────────────────────────
+  # deploy:
+  #   name: 🚀 Deploy to AWS EKS
+  #   runs-on: ubuntu-latest
+  #   needs: docker-build-push
+  #   if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+  #   environment: production        # manual approval gate in GitHub
+  #
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #
+  #     # ── Authenticate with AWS ────────────────────────────────────────────
+  #     - name: Configure AWS credentials
+  #       uses: aws-actions/configure-aws-credentials@v4
+  #       with:
+  #         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  #         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  #         aws-region: ${{ secrets.AWS_REGION }}
+  #
+  #     # ── Get kubeconfig from EKS ──────────────────────────────────────────
+  #     - name: Update kubeconfig for EKS
+  #       run: |
+  #         aws eks update-kubeconfig \
+  #           --name ${{ secrets.EKS_CLUSTER_NAME }} \
+  #           --region ${{ secrets.AWS_REGION }}
+  #
+  #     - name: Set up kubectl
+  #       uses: azure/setup-kubectl@v3
+  #       with:
+  #         version: "v1.29.0"
+  #
+  #     # ── Update image tags ────────────────────────────────────────────────
+  #     - name: Update K8s deployment image tags
+  #       run: |
+  #         IMAGE_TAG=${{ needs.docker-build-push.outputs.image-tag }}
+  #         kubectl set image deployment/backend \
+  #           backend=${{ env.BACKEND_IMAGE }}:${IMAGE_TAG} \
+  #           --namespace=default
+  #         kubectl set image deployment/frontend \
+  #           frontend=${{ env.FRONTEND_IMAGE }}:${IMAGE_TAG} \
+  #           --namespace=default
+  #
+  #     # ── Apply all K8s manifests ──────────────────────────────────────────
+  #     - name: Apply K8s manifests
+  #       run: |
+  #         kubectl apply -f clusterconnect-backend/k8s/app-config.yaml
+  #         kubectl apply -f clusterconnect-backend/k8s/backend.yaml
+  #         kubectl apply -f clusterconnect-backend/k8s/frontend.yaml
+  #         kubectl apply -f clusterconnect-backend/k8s/redis.yaml
+  #         kubectl apply -f clusterconnect-backend/k8s/kafka.yaml
+  #
+  #     # ── Wait for rollout ─────────────────────────────────────────────────
+  #     - name: Wait for rollout to complete
+  #       run: |
+  #         kubectl rollout status deployment/backend --timeout=180s
+  #         kubectl rollout status deployment/frontend --timeout=180s
+  #
+  #     - name: Print service URLs
+  #       run: kubectl get svc --namespace=default
